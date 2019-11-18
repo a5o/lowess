@@ -15,7 +15,9 @@ Scatterplots. J American Statistical Association, 74: 829-836.
 """
 import numpy as np
 import numpy.linalg as la
+import logging
 
+logging.basicConfig(format='%(asctime)s - %(message)s', datefmt='%d-%b-%y %H:%M:%S',level=logging.INFO)
 
 # Kernel functions:
 def epanechnikov(xx, **kwargs):
@@ -102,7 +104,8 @@ def do_kernel(x0, x, l=1.0, kernel=epanechnikov):
     """
     # xx is the norm of x-x0. Note that we broadcast on the second axis for the
     # nd case and then sum on the first to get the norm in each value of x:
-    xx = np.sum(np.sqrt(np.power(x - x0[:, np.newaxis], 2)), 0)
+    #xx = np.sum(np.sqrt(np.power(x - x0[:, np.newaxis], 2)), 0)
+    xx = np.sum(np.abs(x - x0[:, np.newaxis]), 0)
     return kernel(xx, l=l)
 
 
@@ -200,7 +203,11 @@ def lowess(x, y, x0, deg=1, kernel=epanechnikov, l=1, robust=False,):
         B.append(x ** deg)
 
     B = np.vstack(B).T
+    i = 0
     for idx, this_x0 in enumerate(x0.T):
+        if i%100 == 0:
+            logging.info('Lowess progress: ' + str((float(i)/x0.T.shape[0])))
+        i += 1
         # This is necessary in the 1d case (?):
         if not np.iterable(this_x0):
             this_x0 = np.asarray([this_x0])
@@ -225,6 +232,145 @@ def lowess(x, y, x0, deg=1, kernel=epanechnikov, l=1, robust=False,):
         B0 = [1]
         for d in range(1, deg+1):
             B0 = np.hstack([B0, this_x0 ** deg])
+        B0 = np.vstack(B0).T
+        # Estimate the answer based on the parameters:
+        ans[idx] += np.dot(B0, beta)
+    # If we are trying to sample far away from where the function is
+    # defined, we will be trying to invert a singular matrix. In that case,
+    # the regression should not work for you and you should get a nan:
+        #except la.LinAlgError :
+        #    ans[idx] += np.nan
+    return ans.T
+
+def lowess2(x, y, x0, deg=1, kernel=epanechnikov, l=1, robust=False,):
+    """
+    Locally smoothed regression with the LOWESS algorithm.
+
+    Parameters
+    ----------
+    x: float n-d array  
+       Values of x for which f(x) is known (e.g. measured). The shape of this
+       is (n, j), where n is the number the dimensions and j is the
+       number of distinct coordinates sampled.
+    
+    y: float array
+       The known values of f(x) at these points. This has shape (j,) 
+
+    x0: float or float array.
+        Values of x for which we estimate the value of f(x). This is either a
+        single scalar value (only possible for the 1d case, in which case f(x0)
+        is estimated for just that one value of x), or an array of shape (n, k).
+
+    deg: int
+        The degree of smoothing functions. 0 is locally constant, 1 is locally
+        linear, etc. Default: 1.
+        
+    kernel: callable
+        A kernel function. {'epanechnikov', 'tri_cube', 'bi_square'}
+
+    l: float or float array with shape = x.shape
+       The metric window size for the kernel
+
+    robust: bool
+        Whether to apply the robustification procedure from [Cleveland79], page
+        831
+    
+        
+    Returns
+    -------
+    The function estimated at x0. 
+
+    Notes
+    -----
+    The solution to this problem is given by equation 6.8 in Hastie
+    Tibshirani and Friedman (2008). The Elements of Statistical Learning
+    (Chapter 6). 
+
+    Example
+    -------
+    >>> import lowess as lo
+    >>> import numpy as np
+
+    # For the 1D case:
+    >>> x = np.random.randn(100)
+    >>> f = np.cos(x) + 0.2 * np.random.randn(100)
+    >>> x0 = np.linspace(-1, 1, 10)
+    >>> f_hat = lo.lowess(x, f, x0)
+    >>> import matplotlib.pyplot as plt
+    >>> fig, ax = plt.subplots(1)
+    >>> ax.scatter(x, f)
+    >>> ax.plot(x0, f_hat, 'ro')
+    >>> plt.show()
+
+    # 2D case (and more...)
+    >>> x = np.random.randn(2, 100)
+    >>> f = -1 * np.sin(x[0]) + 0.5 * np.cos(x[1]) + 0.2*np.random.randn(100)
+    >>> x0 = np.mgrid[-1:1:.1, -1:1:.1]
+    >>> x0 = np.vstack([x0[0].ravel(), x0[1].ravel()])
+    >>> f_hat = lo.lowess(x, f, x0, kernel=lo.tri_cube)
+    >>> from mpl_toolkits.mplot3d import Axes3D
+    >>> fig = plt.figure()
+    >>> ax = fig.add_subplot(111, projection='3d')
+    >>> ax.scatter(x[0], x[1], f)
+    >>> ax.scatter(x0[0], x0[1], f_hat, color='r')
+    >>> plt.show()
+    """
+    if robust:
+        # We use the procedure described in Cleveland1979
+        # Start by calling this function with robust set to false and the x0
+        # input being equal to the x input:
+        y_est = lowess(x, y, x, kernel=epanechnikov, l=l, robust=False)
+        resid = y_est - y
+        median_resid = np.nanmedian(np.abs(resid))
+        # Calculate the bi-cube function on the residuals for robustness
+        # weights: 
+        robustness_weights = bi_square(resid / (6 * median_resid))
+        
+    # For the case where x0 is provided as a scalar: 
+    if not np.iterable(x0):
+       x0 = np.asarray([x0])
+    ans = np.zeros(x0.shape[-1]) 
+    # We only need one design matrix for fitting:
+    B = [np.ones(x.shape[-1])]
+    for d in range(1, deg+1):
+        B.append(x ** deg)
+
+    B = np.vstack(B).T
+    
+    x_dist = []
+    for this_x0 in x0.T:
+		x_dist.append(x - this_x0[:, np.newaxis])
+    x_dist = np.stack(x_dist,axis=2)
+    xx = np.sum(np.abs(x_dist), 0)
+    kout = kernel(xx,l=l)
+    
+    for idx in range(kout.shape[1]):
+        if idx%100 == 0:
+            logging.info("Lowess progress: " + str(round(float(idx)/kout.shape[1],2)))
+        # Different weighting kernel for each x0:
+        #W = np.diag(kout[:,idx])
+        W = kout[:,idx]
+        # XXX It should be possible to calculate W outside the loop, if x0 and
+        # x are both sampled in some regular fashion (that is, if W is the same
+        # matrix in each iteration). That should save time.
+
+        if robust:
+            # We apply the robustness weights to the weighted least-squares
+            # procedure:
+            robustness_weights[np.isnan(robustness_weights)] = 0
+            W = np.dot(W, np.diag(robustness_weights))
+        #try: 
+        # Equation 6.8 in HTF:
+        #BtWB = np.dot(np.dot(B.T, W), B)
+        BtWB = np.dot(B.T*W, B)
+        #BtW = np.dot(B.T, W)
+        BtW = B.T*W
+        # Get the params:
+        beta = np.dot(np.dot(la.pinv(BtWB), BtW), y.T)
+        # We create a design matrix for this coordinat for back-predicting:
+        B0 = [1]
+        for d in range(1, deg+1):
+            B0 = np.hstack([B0, x0.T[idx] ** deg])
         B0 = np.vstack(B0).T
         # Estimate the answer based on the parameters:
         ans[idx] += np.dot(B0, beta)
